@@ -29,7 +29,7 @@ import database as db
 import source_adapters as sa
 from data_cleaning import homologate_column_names, apply_normalization_dicts, derive_calendar_fields, validate_dataframe
 from duplicate_manager import (
-    compute_file_hash, compute_row_hash, compute_natural_key, diff_records,
+    compute_file_hash, compute_import_key, compute_row_hash, compute_natural_key, diff_records,
 )
 
 
@@ -95,14 +95,17 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
     base_historica, ya_procesado (bool), formato_detectado
     """
     file_hash = compute_file_hash(file_bytes)
+    import_key = compute_import_key(file_bytes, sheet_name)
     fecha_carga = datetime.datetime.now().isoformat(timespec="seconds")
 
-    if db.file_already_processed(file_hash):
+    if db.file_already_processed(import_key):
         return {
             "archivo": filename,
             "ya_procesado": True,
-            "mensaje": "Este archivo (idéntico byte a byte) ya fue cargado previamente. "
-                       "No se realizaron cambios.",
+            "mensaje": "Esta combinación de archivo + hoja ya fue cargada previamente. "
+                       "No se realizaron cambios. (Si quieres procesar una hoja distinta "
+                       "de este mismo archivo, selecciónala arriba y procesa de nuevo — "
+                       "eso sí está permitido.)",
         }
 
     formato_info = sa.detect_format(file_bytes, sheet_name)
@@ -127,6 +130,26 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
     actualizados = 0
 
     with db.get_connection() as conn:
+        # se crea el renglón de importación PRIMERO (con contadores en 0)
+        # para obtener un importacion_id real y poder marcar con él cada
+        # registro/error/actualización de esta carga -- así "deshacer una
+        # importación" (database.delete_import) es exacto y no depende de
+        # adivinar por nombre de archivo + fecha, que pueden coincidir si
+        # dos cargas del mismo archivo ocurren en el mismo segundo.
+        importacion_id = db.log_importacion(conn, {
+            "nombre_archivo": filename,
+            "file_hash": file_hash,
+            "import_key": import_key,
+            "fecha_carga": fecha_carga,
+            "hoja": f"{sheet_name} ({sa.FORMAT_LABELS.get(formato, formato)})",
+            "filas_leidas": filas_leidas,
+            "registros_nuevos": 0,
+            "registros_duplicados": 0,
+            "registros_actualizados": 0,
+            "registros_error": 0,
+            "total_base_historica": 0,
+        })
+
         for _, row in df_validas.iterrows():
             record = row.to_dict()
             row_hash = compute_row_hash(record)
@@ -143,6 +166,7 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
             db_record = {
                 "row_hash": row_hash,
                 "file_hash": file_hash,
+                "importacion_id": importacion_id,
                 "source_format": formato,
                 "source_row_id": record.get("source_row_id"),
                 "occ_idx": record.get("occ_idx"),
@@ -176,6 +200,7 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
                     db.update_registro(conn, existing["id"], db_record)
                     db.log_actualizacion(conn, {
                         "registro_id": existing["id"],
+                        "importacion_id": importacion_id,
                         "row_hash_anterior": existing["row_hash"],
                         "row_hash_nuevo": row_hash,
                         "campos_modificados": json.dumps(modified, ensure_ascii=False),
@@ -194,7 +219,7 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
 
         for idx, err_row in df_errores.iterrows():
             db.log_error(conn, {
-                "importacion_id": None,
+                "importacion_id": importacion_id,
                 "nombre_archivo": filename,
                 "fila_excel": int(idx) + header_row + 2,
                 "motivo": err_row.get("_error_motivo", "Error de validación"),
@@ -207,12 +232,7 @@ def process_uploaded_file(file_bytes: bytes, filename: str, sheet_name) -> dict:
 
         total_base = conn.execute("SELECT COUNT(*) FROM registros").fetchone()[0]
 
-        importacion_id = db.log_importacion(conn, {
-            "nombre_archivo": filename,
-            "file_hash": file_hash,
-            "fecha_carga": fecha_carga,
-            "hoja": f"{sheet_name} ({sa.FORMAT_LABELS.get(formato, formato)})",
-            "filas_leidas": filas_leidas,
+        db.update_importacion_counts(conn, importacion_id, {
             "registros_nuevos": nuevos,
             "registros_duplicados": duplicados,
             "registros_actualizados": actualizados,

@@ -56,6 +56,14 @@ def compute_file_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+def compute_import_key(file_bytes: bytes, sheet_name) -> str:
+    """Identidad de UNA CARGA = archivo + hoja elegida. Distinto de
+    compute_file_hash (que solo identifica el archivo): dos cargas del
+    mismo archivo con hojas DISTINTAS deben poder procesarse ambas."""
+    payload = compute_file_hash(file_bytes) + "::" + str(sheet_name)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _serialize_value(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""

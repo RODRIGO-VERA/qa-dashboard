@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS registros (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     row_hash TEXT UNIQUE NOT NULL,
     file_hash TEXT NOT NULL,
+    importacion_id INTEGER,
     source_format TEXT,
     source_row_id TEXT,
     occ_idx TEXT,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS importaciones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     nombre_archivo TEXT,
     file_hash TEXT,
+    import_key TEXT,
     fecha_carga TEXT,
     hoja TEXT,
     filas_leidas INTEGER,
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS errores_importacion (
 CREATE TABLE IF NOT EXISTS historial_actualizaciones (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     registro_id INTEGER,
+    importacion_id INTEGER,
     row_hash_anterior TEXT,
     row_hash_nuevo TEXT,
     campos_modificados TEXT,
@@ -116,10 +119,15 @@ def init_db():
         conn.executescript(SCHEMA)
 
 
-def file_already_processed(file_hash: str) -> bool:
+def file_already_processed(import_key: str) -> bool:
+    """Verifica si esta combinación EXACTA de (archivo, hoja) ya fue
+    procesada. Usa import_key (hash de bytes del archivo + nombre de hoja),
+    NO solo el hash del archivo -- así, procesar la MISMA hoja dos veces se
+    detecta como duplicado, pero elegir una hoja DISTINTA del mismo archivo
+    (ej. corregir una selección de hoja equivocada) sí se permite procesar."""
     with get_connection() as conn:
         cur = conn.execute(
-            "SELECT COUNT(*) FROM importaciones WHERE file_hash = ?", (file_hash,)
+            "SELECT COUNT(*) FROM importaciones WHERE import_key = ?", (import_key,)
         )
         return cur.fetchone()[0] > 0
 
@@ -175,6 +183,16 @@ def log_importacion(conn, info: dict) -> int:
         [info[c] for c in cols],
     )
     return cur.lastrowid
+
+
+def update_importacion_counts(conn, importacion_id: int, counts: dict):
+    """Actualiza los contadores finales de una importación ya creada
+    (se crea primero con placeholders para obtener su id, se usa ese id en
+    cada registro/error insertado durante la carga, y al final se completan
+    los contadores reales)."""
+    set_clause = ", ".join([f"{c} = ?" for c in counts.keys()])
+    params = list(counts.values()) + [importacion_id]
+    conn.execute(f"UPDATE importaciones SET {set_clause} WHERE id = ?", params)
 
 
 def log_error(conn, info: dict):
@@ -288,3 +306,39 @@ def get_db_info() -> dict:
         "tamano_kb": round(stat.st_size / 1024, 1),
         "modificado": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def delete_import(importacion_id: int):
+    """Elimina TODOS los registros que provienen de una importación
+    específica, identificados por 'importacion_id' (no por fecha/nombre,
+    que pueden coincidir entre dos cargas del mismo archivo hechas en el
+    mismo segundo). No afecta ninguna otra importación."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM importaciones WHERE id = ?", (importacion_id,)
+        ).fetchone()
+        if row is None:
+            return {"eliminado": False, "motivo": "No existe esa importación."}
+
+        cur = conn.execute(
+            "DELETE FROM registros WHERE importacion_id = ?", (importacion_id,)
+        )
+        registros_eliminados = cur.rowcount
+
+        conn.execute(
+            "DELETE FROM historial_actualizaciones WHERE importacion_id = ?", (importacion_id,)
+        )
+        conn.execute(
+            "DELETE FROM errores_importacion WHERE importacion_id = ?", (importacion_id,)
+        )
+        conn.execute("DELETE FROM importaciones WHERE id = ?", (importacion_id,))
+
+        return {"eliminado": True, "registros_eliminados": registros_eliminados}
+
+
+def reset_database():
+    """Borra TODOS los datos de las 4 tablas (mantiene el esquema). Acción
+    destructiva total -- usar solo para empezar completamente de cero."""
+    with get_connection() as conn:
+        for tabla in ["registros", "importaciones", "errores_importacion", "historial_actualizaciones"]:
+            conn.execute(f"DELETE FROM {tabla}")

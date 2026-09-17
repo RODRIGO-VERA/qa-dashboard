@@ -562,6 +562,33 @@ elif page == "⚙️ Historial de Importaciones":
     else:
         st.dataframe(df_imp, use_container_width=True, hide_index=True)
 
+        st.subheader("¿Cargaste algo por error? Deshaz una importación puntual")
+        st.caption(
+            "Elimina SOLO los registros que entraron por una importación específica (por "
+            "ejemplo, si elegiste la hoja equivocada). No afecta a las demás cargas."
+        )
+        opciones_import = {
+            f"#{row.id} — {row.nombre_archivo} — {row.hoja} — {row.fecha_carga} "
+            f"({row.registros_nuevos} nuevos)": row.id
+            for row in df_imp.itertuples()
+        }
+        seleccion = st.selectbox("Importación a deshacer", list(opciones_import.keys()),
+                                  index=None, placeholder="Elige una importación...")
+        if seleccion:
+            importacion_id = opciones_import[seleccion]
+            confirmar_del = st.checkbox(
+                "Confirmo que quiero eliminar los registros de esta importación.",
+                key="confirmar_delete_import",
+            )
+            if st.button("🗑️ Eliminar esta importación", disabled=not confirmar_del):
+                resultado = db.delete_import(importacion_id)
+                refresh()
+                if resultado["eliminado"]:
+                    st.success(f"Se eliminaron {resultado['registros_eliminados']} registros de esa importación.")
+                    st.rerun()
+                else:
+                    st.error(resultado["motivo"])
+
         st.subheader("Errores de importación")
         df_err = db.load_errores()
         if df_err.empty:
@@ -679,3 +706,19 @@ elif page == "🛡️ Respaldo y Restauración":
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudo restaurar el respaldo: {e}")
+
+    st.divider()
+    st.subheader("🗑️ Borrar toda la base y empezar de cero")
+    st.caption(
+        "Elimina TODOS los registros de TODAS las fuentes, sin posibilidad de deshacerlo "
+        "(salvo que tengas un respaldo descargado). Útil si quieres reiniciar completamente."
+    )
+    confirmar_reset = st.checkbox(
+        "Entiendo que esto borra TODA la base de datos actual de forma permanente.",
+        key="confirmar_reset_total",
+    )
+    if st.button("🗑️ Borrar TODO y empezar de cero", disabled=not confirmar_reset):
+        db.reset_database()
+        refresh()
+        st.success("Base de datos vaciada. Puedes empezar a cargar tus archivos de nuevo.")
+        st.rerun()
